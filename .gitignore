@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Data shards, checkpoints and run outputs live on Drive / locally, never in git
+data/shards/
+checkpoints/
+runs/
+*.pt
+*.bin
+*.npy
+
+# Notebook and OS noise
+.ipynb_checkpoints/
+.DS_Store

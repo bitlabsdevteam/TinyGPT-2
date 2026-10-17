@@ -1,0 +1,10 @@
+# Core (installable with pip in a Colab cell)
+torch
+datasets
+tiktoken
+matplotlib
+tensorboard
+# QLoRA 4-bit quantization (GPU only)
+bitsandbytes
+# Weight loading and verification only (never imported by the model)
+transformers
