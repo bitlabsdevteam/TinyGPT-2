@@ -4,13 +4,13 @@
 
 **Blocked by:** 03, 06
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Loss decreases over a short run
-- [ ] Weight decay applies only to 2-D parameters
-- [ ] Effective batch size equals micro-batch x accumulation
-- [ ] Same seed gives same losses
-- [ ] Token cap stops the run
-- [ ] Config is logged with the run
+- [x] Loss decreases over a short run
+- [x] Weight decay applies only to 2-D parameters
+- [x] Effective batch size equals micro-batch x accumulation
+- [x] Same seed gives same losses
+- [x] Token cap stops the run
+- [x] Config is logged with the run
 
 Spec: spec.md
