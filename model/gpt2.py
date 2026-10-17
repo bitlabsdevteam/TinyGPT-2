@@ -87,6 +87,60 @@ class GPT(nn.Module):
             )
         return logits, loss
 
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Autoregressive generation: extend `idx` by `max_new_tokens` sampled tokens.
+
+        idx: (B, T) prompt token ids. Returns (B, T + max_new_tokens), the prompt
+        followed by the new tokens.
+
+        The loop, repeated once per new token:
+            1. run the model on the sequence so far (cropped to block_size)
+            2. take the logits of the LAST position: the prediction for the next token
+            3. divide by temperature, optionally keep only the top_k candidates
+            4. softmax -> probabilities, sample one token, append it
+
+        temperature rescales the logits before softmax. Below 1 the distribution
+        sharpens (towards always picking the most likely token); above 1 it flattens
+        (towards uniform). It must be > 0, since 0 would divide by zero.
+        top_k keeps only the k highest-scoring tokens and gives every other token
+        probability 0, which stops rare, low-quality tokens from ever being sampled.
+        top_k=1 is greedy decoding.
+
+        Randomness comes from torch's global RNG, so torch.manual_seed(...) before
+        calling makes the output reproducible.
+        """
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+
+        # Dropout is a training-time regulariser; generation must be deterministic
+        # given the seed, so switch to eval mode and restore the caller's mode after.
+        was_training = self.training
+        self.eval()
+        try:
+            for _ in range(max_new_tokens):
+                # The model has only block_size position embeddings, so once the
+                # sequence is longer it can only look at the most recent block_size tokens.
+                idx_cond = idx[:, -self.config.block_size:]  # (B, T) -> (B, min(T, block_size))
+                logits, _ = self(idx_cond)  # (B, T', V)
+                logits = logits[:, -1, :] / temperature  # (B, T', V) -> (B, V): last position only
+                if top_k is not None:
+                    k = min(top_k, logits.size(-1))
+                    kth_best = torch.topk(logits, k).values[:, [-1]]  # (B, 1): the k-th highest logit
+                    logits = logits.masked_fill(logits < kth_best, float("-inf"))  # (B, V)
+                probs = F.softmax(logits, dim=-1)  # (B, V), rows sum to 1
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                idx = torch.cat((idx, next_token), dim=1)  # (B, T) -> (B, T + 1)
+        finally:
+            self.train(was_training)
+        return idx
+
 
 def to_hf_name(name: str) -> str:
     """Map one of our parameter names to its Hugging Face GPT-2 name.

@@ -4,10 +4,10 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Generation is reproducible given a seed
-- [ ] Output length and context cropping behave correctly beyond the context length
-- [ ] Temperature and top-k change the sampling distribution as expected
+- [x] Generation is reproducible given a seed
+- [x] Output length and context cropping behave correctly beyond the context length
+- [x] Temperature and top-k change the sampling distribution as expected
 
 Spec: spec.md
