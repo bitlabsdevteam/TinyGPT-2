@@ -4,11 +4,11 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Output shape equals input shape for both presets
-- [ ] Changing a future token leaves earlier positions' outputs unchanged
-- [ ] Comments cover what/why, shapes at each step, and the softmax(QK^T/sqrt(d_k)+mask)V math
-- [ ] Projections are nn.Linear and named to match Hugging Face GPT-2
+- [x] Output shape equals input shape for both presets
+- [x] Changing a future token leaves earlier positions' outputs unchanged
+- [x] Comments cover what/why, shapes at each step, and the softmax(QK^T/sqrt(d_k)+mask)V math
+- [x] Projections are nn.Linear and named to match Hugging Face GPT-2
 
 Spec: spec.md
