@@ -4,12 +4,12 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Each Section has a shape test
-- [ ] LM head shares storage with the token embedding
-- [ ] A tiny batch overfits to ~0 loss
-- [ ] Parameter names match Hugging Face GPT-2
-- [ ] Every Section is its own module and heavily commented
+- [x] Each Section has a shape test
+- [x] LM head shares storage with the token embedding
+- [x] A tiny batch overfits to ~0 loss
+- [x] Parameter names match Hugging Face GPT-2
+- [x] Every Section is its own module and heavily commented
 
 Spec: spec.md
