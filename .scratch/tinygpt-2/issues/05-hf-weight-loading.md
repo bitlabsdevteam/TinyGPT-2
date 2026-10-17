@@ -4,10 +4,10 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Conv1D weights are transposed correctly; mask buffers are skipped (checked against the installed transformers version)
-- [ ] Logits match within a documented tolerance on sample inputs
-- [ ] Test is skipped cleanly when transformers or network is unavailable
+- [x] Conv1D weights are transposed correctly; mask buffers are skipped (checked against the installed transformers version)
+- [x] Logits match within a documented tolerance on sample inputs
+- [x] Test is skipped cleanly when transformers or network is unavailable
 
 Spec: spec.md
