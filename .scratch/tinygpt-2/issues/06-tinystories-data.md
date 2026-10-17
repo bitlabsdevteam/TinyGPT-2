@@ -4,11 +4,11 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Shards written and re-readable (location configurable, e.g. Drive)
-- [ ] Story boundaries are marked with <|endoftext|>
-- [ ] Loader yields (input, target) batches of the requested shape and is seed-deterministic
-- [ ] Tokenization is skipped when shards already exist
+- [x] Shards written and re-readable (location configurable, e.g. Drive)
+- [x] Story boundaries are marked with <|endoftext|>
+- [x] Loader yields (input, target) batches of the requested shape and is seed-deterministic
+- [x] Tokenization is skipped when shards already exist
 
 Spec: spec.md
