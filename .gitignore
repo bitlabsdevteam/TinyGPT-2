@@ -15,3 +15,6 @@ runs/
 # Notebook and OS noise
 .ipynb_checkpoints/
 .DS_Store
+
+# Local notebook dry-run scratch folder
+.notebook_runs/

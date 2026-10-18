@@ -1,2 +1,6 @@
 -r requirements.txt
 pytest
+# executing the Colab notebook in tests
+nbformat
+nbclient
+ipykernel
