@@ -4,10 +4,10 @@
 
 **Blocked by:** 07
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] A run resumed from a Checkpoint reproduces the losses of an uninterrupted run
-- [ ] Latest Checkpoint is found automatically
-- [ ] Checkpoint location is configurable (Drive in Colab)
+- [x] A run resumed from a Checkpoint reproduces the losses of an uninterrupted run
+- [x] Latest Checkpoint is found automatically
+- [x] Checkpoint location is configurable (Drive in Colab)
 
 Spec: spec.md

@@ -26,12 +26,15 @@ import torch
 from data.loader import TokenLoader
 from model.config import GPTConfig, gpt2_small, small
 from model.gpt2 import GPT
+from train.checkpoint import (
+    capture_rng_state, latest_checkpoint, load_checkpoint, restore_rng_state, save_checkpoint,
+)
 
 
 @dataclass
 class TrainConfig:
     data_dir: str  # folder holding the train / validation shards (see data/prepare.py)
-    out_dir: str  # where config.json (and later checkpoints) are written
+    out_dir: str  # where config.json (and, by default, checkpoints) are written
 
     # Batch size. The *effective* batch is batch_size * grad_accum_steps sequences per
     # optimizer step. A big effective batch gives smooth gradients, but does not fit in
@@ -58,6 +61,18 @@ class TrainConfig:
     eval_batches: int = 20  # micro-batches averaged per validation
     log_interval: int = 10  # print a progress line every this many steps
 
+    # Checkpointing (see train/checkpoint.py). On Colab point checkpoint_dir at Google Drive
+    # so that a new session after a disconnect can resume.
+    checkpoint_dir: str | None = None  # None = <out_dir>/checkpoints
+    checkpoint_interval: int = 100  # save every this many steps (and always at the end / on pause)
+    keep_last: int = 2  # how many checkpoints to keep on disk
+    resume: bool = True  # continue from the latest checkpoint in checkpoint_dir, if any
+    # Pause the run after this optimizer step (a checkpoint is written), WITHOUT changing the
+    # learning-rate schedule, which still plans for the whole run. For time-boxing a Colab
+    # session. It is an absolute step number: a run that has already reached it does nothing,
+    # so re-running the same cell is harmless; raise or remove it to continue.
+    stop_after_step: int | None = None
+
     seed: int = 1337
     device: str | None = None  # None = cuda if available, else cpu
     dtype: str = "auto"  # "auto", "bf16", "fp16" or "fp32"; see resolve_precision
@@ -71,6 +86,8 @@ class PretrainResult:
     tokens_per_step: int
     tokens_seen: int
     config_path: str
+    start_step: int  # step this call resumed from (0 = a fresh start)
+    checkpoint_dir: str
 
 
 def seed_everything(seed: int) -> None:
@@ -182,8 +199,35 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
         raise ValueError(
             f"token cap {max_tokens} is smaller than one optimizer step ({tokens_per_step} tokens)")
 
-    # Log the complete configuration with the run, so any result can be traced to its settings.
+    optimizer = configure_optimizer(
+        model, cfg.learning_rate, cfg.weight_decay, (cfg.beta1, cfg.beta2), device_type)
+    # With enabled=False the scaler is a transparent pass-through (bf16 / fp32 runs).
+    scaler = torch.amp.GradScaler(device_type, enabled=use_scaler)
+
+    # Resume: if a checkpoint exists, restore EVERYTHING it holds (see train/checkpoint.py),
+    # so the run carries on exactly as if it had never been interrupted. This happens after
+    # the model, optimizer and loader are built, because restoring overwrites their state
+    # (and the random number generators, which building them consumed).
     out_dir = Path(cfg.out_dir)
+    checkpoint_dir = Path(cfg.checkpoint_dir) if cfg.checkpoint_dir else out_dir / "checkpoints"
+    train_log, eval_log = [], []
+    start_step = 0
+    latest = latest_checkpoint(checkpoint_dir) if cfg.resume else None
+    if latest is not None:
+        state = load_checkpoint(latest)
+        if state["model_config"] != asdict(model_config):
+            raise ValueError(
+                f"{latest} was saved by a different model {state['model_config']}, "
+                f"not {asdict(model_config)}; use another checkpoint_dir or set resume=False")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scaler.load_state_dict(state["scaler"])
+        train_loader.generator.set_state(state["train_loader_rng"])
+        restore_rng_state(state["rng"])
+        start_step, train_log, eval_log = state["step"], state["train_log"], state["eval_log"]
+        print(f"resumed from {latest.name} (step {start_step}/{num_steps})")
+
+    # Log the complete configuration with the run, so any result can be traced to its settings.
     out_dir.mkdir(parents=True, exist_ok=True)
     config_path = out_dir / "config.json"
     config_path.write_text(json.dumps({
@@ -195,16 +239,28 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
         "tokens_per_step": tokens_per_step,
         "max_tokens": max_tokens,
         "num_steps": num_steps,
+        "resumed_from_step": start_step,
+        "checkpoint_dir": str(checkpoint_dir),
         "torch_version": torch.__version__,
     }, indent=2))
 
-    optimizer = configure_optimizer(
-        model, cfg.learning_rate, cfg.weight_decay, (cfg.beta1, cfg.beta2), device_type)
-    # With enabled=False the scaler is a transparent pass-through (bf16 / fp32 runs).
-    scaler = torch.amp.GradScaler(device_type, enabled=use_scaler)
+    def checkpoint(done: int) -> None:
+        save_checkpoint(checkpoint_dir, done, {
+            "step": done,
+            "model_config": asdict(model_config),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "train_loader_rng": train_loader.generator.get_state(),
+            "rng": capture_rng_state(),
+            "train_log": train_log,
+            "eval_log": eval_log,
+        }, keep_last=cfg.keep_last)
 
-    train_log, eval_log = [], []
-    for step in range(num_steps):
+    # Where this call stops: the end of the run, or the pause point if that comes first.
+    end_step = num_steps if cfg.stop_after_step is None else min(num_steps, cfg.stop_after_step)
+    done = start_step
+    for step in range(start_step, end_step):
         # 1. Learning rate for this step.
         lr = get_lr(step, cfg, num_steps)
         for group in optimizer.param_groups:
@@ -246,9 +302,15 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
             eval_log.append({"step": done, "val_loss": val_loss})
             print(f"step {done}/{num_steps} | val_loss {val_loss:.4f} | val_ppl {math.exp(val_loss):.2f}")
 
+        # 5. Checkpoint on the interval, when the run completes, and when it is paused.
+        #    Saved AFTER validation so the saved history includes this step's validation.
+        if done % cfg.checkpoint_interval == 0 or done == end_step:
+            checkpoint(done)
+
     return PretrainResult(
         model=model, train_log=train_log, eval_log=eval_log, tokens_per_step=tokens_per_step,
-        tokens_seen=num_steps * tokens_per_step, config_path=str(config_path))
+        tokens_seen=done * tokens_per_step, config_path=str(config_path),
+        start_step=start_step, checkpoint_dir=str(checkpoint_dir))
 
 
 PRESETS = {"gpt2_small": gpt2_small, "small": small}
@@ -263,8 +325,14 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accum_steps", type=int, default=TrainConfig.grad_accum_steps)
     parser.add_argument("--learning_rate", type=float, default=TrainConfig.learning_rate)
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
+    parser.add_argument("--checkpoint_dir", default=None, help="e.g. a Google Drive folder")
+    parser.add_argument("--checkpoint_interval", type=int, default=TrainConfig.checkpoint_interval)
+    parser.add_argument("--stop_after_step", type=int, default=None, help="pause after this step")
+    parser.add_argument("--no_resume", action="store_true", help="ignore existing checkpoints")
     args = parser.parse_args()
     pretrain(PRESETS[args.preset](), TrainConfig(
         data_dir=args.data_dir, out_dir=args.out_dir, max_tokens=args.max_tokens,
         batch_size=args.batch_size, grad_accum_steps=args.grad_accum_steps,
-        learning_rate=args.learning_rate, seed=args.seed))
+        learning_rate=args.learning_rate, seed=args.seed, checkpoint_dir=args.checkpoint_dir,
+        checkpoint_interval=args.checkpoint_interval, stop_after_step=args.stop_after_step,
+        resume=not args.no_resume))
