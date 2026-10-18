@@ -107,7 +107,7 @@ class _NoProfiler:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_):
         return False
 
     def step(self):
