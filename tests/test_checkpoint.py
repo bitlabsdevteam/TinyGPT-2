@@ -27,6 +27,7 @@ def run(root, model=MODEL, **overrides):
         max_tokens=20 * 2 * 2 * MODEL.block_size,  # 20 optimizer steps
         learning_rate=3e-3, min_lr=3e-4, warmup_steps=3, eval_interval=6, eval_batches=2,
         log_interval=1000, checkpoint_interval=5, seed=0, device="cpu",
+        sample_prompts=(), profile=False,  # covered by tests/test_profile.py
     )
     cfg.update(overrides)
     return pretrain(model, TrainConfig(**cfg))

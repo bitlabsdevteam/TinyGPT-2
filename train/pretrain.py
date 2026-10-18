@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -28,6 +29,10 @@ from model.config import GPTConfig, gpt2_small, small
 from model.gpt2 import GPT
 from train.checkpoint import (
     capture_rng_state, latest_checkpoint, load_checkpoint, restore_rng_state, save_checkpoint,
+)
+from train.profiling import (
+    estimate_flops_per_token, generate_samples, make_profiler, peak_flops, peak_memory_bytes,
+    write_profile_report,
 )
 
 
@@ -73,6 +78,21 @@ class TrainConfig:
     # so re-running the same cell is harmless; raise or remove it to continue.
     stop_after_step: int | None = None
 
+    # Profiling (see train/profiling.py). A torch.profiler trace is recorded for a few steps
+    # at the start of each session; the rest of the Profile report is always produced.
+    profile: bool = True
+    profile_wait: int = 1  # steps skipped before profiling starts
+    profile_warmup: int = 1  # steps profiled but discarded
+    profile_active: int = 3  # steps recorded into the trace file
+    peak_tflops: float | None = None  # override the GPU's peak TFLOP/s for MFU (unknown GPUs)
+
+    # Sample generations: at every checkpoint the model completes each prompt, so you can
+    # read what it has learned. Use () to switch off.
+    sample_prompts: tuple = ("Once upon a time", "One day, a little girl named Lily")
+    sample_tokens: int = 64  # new tokens generated per prompt
+    sample_temperature: float = 0.8
+    sample_top_k: int = 40
+
     seed: int = 1337
     device: str | None = None  # None = cuda if available, else cpu
     dtype: str = "auto"  # "auto", "bf16", "fp16" or "fp32"; see resolve_precision
@@ -88,6 +108,8 @@ class PretrainResult:
     config_path: str
     start_step: int  # step this call resumed from (0 = a fresh start)
     checkpoint_dir: str
+    report: dict  # the Profile report (also saved as profile_report.json)
+    report_path: str
 
 
 def seed_everything(seed: int) -> None:
@@ -210,7 +232,7 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
     # (and the random number generators, which building them consumed).
     out_dir = Path(cfg.out_dir)
     checkpoint_dir = Path(cfg.checkpoint_dir) if cfg.checkpoint_dir else out_dir / "checkpoints"
-    train_log, eval_log = [], []
+    train_log, eval_log, samples = [], [], []
     start_step = 0
     latest = latest_checkpoint(checkpoint_dir) if cfg.resume else None
     if latest is not None:
@@ -225,6 +247,7 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
         train_loader.generator.set_state(state["train_loader_rng"])
         restore_rng_state(state["rng"])
         start_step, train_log, eval_log = state["step"], state["train_log"], state["eval_log"]
+        samples = state.get("samples", [])
         print(f"resumed from {latest.name} (step {start_step}/{num_steps})")
 
     # Log the complete configuration with the run, so any result can be traced to its settings.
@@ -245,6 +268,11 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
     }, indent=2))
 
     def checkpoint(done: int) -> None:
+        # Sample generations at every checkpoint: a qualitative check on the loss numbers.
+        # They are kept in the checkpoint so a resumed run's report covers the whole run.
+        samples.extend(generate_samples(
+            model, cfg.sample_prompts, done, cfg.sample_tokens, cfg.sample_temperature,
+            cfg.sample_top_k, cfg.seed, device))
         save_checkpoint(checkpoint_dir, done, {
             "step": done,
             "model_config": asdict(model_config),
@@ -255,62 +283,102 @@ def pretrain(model_config: GPTConfig, cfg: TrainConfig) -> PretrainResult:
             "rng": capture_rng_state(),
             "train_log": train_log,
             "eval_log": eval_log,
+            "samples": samples,
         }, keep_last=cfg.keep_last)
 
     # Where this call stops: the end of the run, or the pause point if that comes first.
     end_step = num_steps if cfg.stop_after_step is None else min(num_steps, cfg.stop_after_step)
+
+    # Profiling set-up: theoretical FLOPs per token and the GPU's peak (for MFU), and a fresh
+    # peak-memory counter so the figure reflects this session only.
+    flops_per_token = estimate_flops_per_token(model)
+    peak = peak_flops(device_type, amp_dtype, cfg.peak_tflops)
+    if device_type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    trace_dir = out_dir / "profile"
+    profiler = make_profiler(
+        cfg.profile, trace_dir, cfg.profile_wait, cfg.profile_warmup, cfg.profile_active, device_type)
+
+    def synchronize() -> None:
+        # GPU kernels run asynchronously: without waiting for them, the clock would
+        # measure how fast work was QUEUED, not how fast it was done.
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+
     done = start_step
-    for step in range(start_step, end_step):
-        # 1. Learning rate for this step.
-        lr = get_lr(step, cfg, num_steps)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+    with profiler as prof:
+        for step in range(start_step, end_step):
+            synchronize()
+            step_start = time.perf_counter()
 
-        # 2. Accumulate gradients over several micro-batches.
-        optimizer.zero_grad(set_to_none=True)
-        step_loss = 0.0
-        for _ in range(cfg.grad_accum_steps):
-            x, y = (t.to(device) for t in train_loader.get_batch())  # each (batch_size, T)
-            with torch.autocast(device_type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                _, loss = model(x, y)
-            # backward() SUMS gradients into .grad. To end up with the gradient of the
-            # AVERAGE loss over all micro-batches (what one big batch would give), each
-            # micro-batch loss is divided by the number of micro-batches first.
-            loss = loss / cfg.grad_accum_steps
-            step_loss += loss.item()
-            scaler.scale(loss).backward()
+            # 1. Learning rate for this step.
+            lr = get_lr(step, cfg, num_steps)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
 
-        # 3. Clip, then step. Gradient clipping rescales the whole gradient when its
-        #    norm exceeds grad_clip, so one freak batch cannot throw the weights far off.
-        #    With fp16 the gradients must be un-scaled before their norm means anything.
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
-        scaler.step(optimizer)
-        scaler.update()
+            # 2. Accumulate gradients over several micro-batches.
+            optimizer.zero_grad(set_to_none=True)
+            step_loss = 0.0
+            for _ in range(cfg.grad_accum_steps):
+                x, y = (t.to(device) for t in train_loader.get_batch())  # each (batch_size, T)
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                    _, loss = model(x, y)
+                # backward() SUMS gradients into .grad. To end up with the gradient of the
+                # AVERAGE loss over all micro-batches (what one big batch would give), each
+                # micro-batch loss is divided by the number of micro-batches first.
+                loss = loss / cfg.grad_accum_steps
+                step_loss += loss.item()
+                scaler.scale(loss).backward()
 
-        done = step + 1
-        train_log.append({
-            "step": done, "loss": step_loss, "lr": lr, "grad_norm": grad_norm,  # norm BEFORE clipping
-            "tokens_seen": done * tokens_per_step,
-        })
-        if done % cfg.log_interval == 0 or done == num_steps:
-            print(f"step {done}/{num_steps} | loss {step_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.2f}")
+            # 3. Clip, then step. Gradient clipping rescales the whole gradient when its
+            #    norm exceeds grad_clip, so one freak batch cannot throw the weights far off.
+            #    With fp16 the gradients must be un-scaled before their norm means anything.
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
+            scaler.step(optimizer)
+            scaler.update()
 
-        # 4. Periodic validation, and one at the very end.
-        if done % cfg.eval_interval == 0 or done == num_steps:
-            val_loss = evaluate(model, cfg, model_config.block_size, device, device_type, amp_dtype)
-            eval_log.append({"step": done, "val_loss": val_loss})
-            print(f"step {done}/{num_steps} | val_loss {val_loss:.4f} | val_ppl {math.exp(val_loss):.2f}")
+            # Step time covers the training work only, not validation or checkpointing.
+            synchronize()
+            step_time = time.perf_counter() - step_start
 
-        # 5. Checkpoint on the interval, when the run completes, and when it is paused.
-        #    Saved AFTER validation so the saved history includes this step's validation.
-        if done % cfg.checkpoint_interval == 0 or done == end_step:
-            checkpoint(done)
+            done = step + 1
+            train_log.append({
+                "step": done, "loss": step_loss, "lr": lr, "grad_norm": grad_norm,  # norm BEFORE clipping
+                "tokens_seen": done * tokens_per_step,
+                "step_time_s": step_time, "tokens_per_sec": tokens_per_step / step_time,
+            })
+            if done % cfg.log_interval == 0 or done == num_steps:
+                print(f"step {done}/{num_steps} | loss {step_loss:.4f} | lr {lr:.2e} | "
+                      f"grad_norm {grad_norm:.2f} | {tokens_per_step / step_time:,.0f} tok/s")
+
+            # 4. Periodic validation, and one at the very end.
+            if done % cfg.eval_interval == 0 or done == num_steps:
+                val_loss = evaluate(model, cfg, model_config.block_size, device, device_type, amp_dtype)
+                eval_log.append({"step": done, "val_loss": val_loss, "val_ppl": math.exp(val_loss)})
+                print(f"step {done}/{num_steps} | val_loss {val_loss:.4f} | val_ppl {math.exp(val_loss):.2f}")
+
+            # 5. Checkpoint on the interval, when this call finishes (run complete or paused).
+            #    Saved AFTER validation so the saved history includes this step's validation.
+            if done % cfg.checkpoint_interval == 0 or done == end_step:
+                checkpoint(done)
+
+            prof.step()  # tell the profiler one optimizer step has finished
+
+    # The Profile report: numbers, loss-curve image, samples; see train/profiling.py.
+    report = write_profile_report(
+        out_dir, train_log=train_log, eval_log=eval_log, samples=samples,
+        tokens_per_step=tokens_per_step, flops_per_token=flops_per_token, peak=peak,
+        peak_memory=peak_memory_bytes(device_type), device=device,
+        dtype_name={torch.bfloat16: "bf16", torch.float16: "fp16"}.get(amp_dtype, "fp32"),
+        trace_dir=trace_dir)
+    print(f"Profile report: {out_dir / 'profile_report.json'}")
 
     return PretrainResult(
         model=model, train_log=train_log, eval_log=eval_log, tokens_per_step=tokens_per_step,
         tokens_seen=done * tokens_per_step, config_path=str(config_path),
-        start_step=start_step, checkpoint_dir=str(checkpoint_dir))
+        start_step=start_step, checkpoint_dir=str(checkpoint_dir),
+        report=report, report_path=str(out_dir / "profile_report.json"))
 
 
 PRESETS = {"gpt2_small": gpt2_small, "small": small}

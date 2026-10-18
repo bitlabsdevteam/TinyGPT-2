@@ -31,6 +31,7 @@ def run(tmp_path, steps=20, **overrides):
         data_dir=str(tmp_path), out_dir=str(tmp_path / "run"), batch_size=2, grad_accum_steps=2,
         learning_rate=3e-3, min_lr=3e-4, warmup_steps=5, eval_interval=10, eval_batches=2,
         log_interval=1000, seed=0, device="cpu",
+        sample_prompts=(), profile=False,  # covered by tests/test_profile.py
     )
     cfg.update(overrides)
     cfg.setdefault("max_tokens", steps * cfg["batch_size"] * cfg["grad_accum_steps"] * MODEL.block_size)
@@ -93,7 +94,7 @@ def test_without_a_token_cap_the_run_is_one_pass_over_the_train_split(tmp_path):
     make_data(tmp_path, tokens=np.tile(np.arange(10), 64))  # 640 tokens
     result = pretrain(MODEL, TrainConfig(
         data_dir=str(tmp_path), out_dir=str(tmp_path / "run"), batch_size=2, grad_accum_steps=1,
-        eval_interval=1000, log_interval=1000, device="cpu"))
+        eval_interval=1000, log_interval=1000, device="cpu", sample_prompts=(), profile=False))
     assert len(result.train_log) == 640 // (2 * MODEL.block_size)
 
 
